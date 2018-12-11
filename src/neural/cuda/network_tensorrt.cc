@@ -1,6 +1,7 @@
 #include <memory>
 #include <iostream>
 #include <string>
+#include <cstdio>
 #include "cuda_common.h"
 #include "NvInfer.h"
 #include "neural/factory.h"
@@ -20,6 +21,7 @@ class Logger : public nvi::ILogger {
 
 class TensorRTNetwork : public Network {
 private:
+    nvi::IRuntime* runtime;
     nvi::IBuilder* builder;
     nvi::ICudaEngine* engine;
     int max_batch_size;
@@ -39,6 +41,10 @@ nvi::ITensor* name_and_get_output(nvi::ILayer* layer, std::string name) {
     return layer->getOutput(0);
 }
 
+bool is_identity_elementwise(const FloatVector& values, float identity = 0) {
+    return std::all_of(values.begin(), values.end(), [=](float x) { return x == identity; });
+}
+
 nvi::ITensor* process_bn(const FloatVector& bn_means, const FloatVector& bn_stddivs,
                          const FloatVector& bn_gammas,const FloatVector& bn_betas,
                          nvi::ITensor* input, nvi::INetworkDefinition* network,
@@ -47,18 +53,22 @@ nvi::ITensor* process_bn(const FloatVector& bn_means, const FloatVector& bn_stdd
     nvi::Dims3 dims_channel{num_channels, 1, 1};
     nvi::DataType dt = nvi::DataType::kFLOAT;
 
-    auto bn_means_c = name_and_get_output(network->addConstant(dims_channel, vector_to_weights(bn_means)), name + "/constant_mean");
-    auto bn_stddivs_c = name_and_get_output(network->addConstant(dims_channel, vector_to_weights(bn_stddivs)), name + "/constant_stddiv");
+    if(!is_identity_elementwise(bn_means, 0.0)) {
+        auto bn_means_c = name_and_get_output(network->addConstant(dims_channel, vector_to_weights(bn_means)), name + "/constant_mean");
+        input = name_and_get_output(network->addElementWise(*input, *bn_means_c, nvi::ElementWiseOperation::kMIN), name + "/mean_sub");
+    }
 
-    input = name_and_get_output(network->addElementWise(*input, *bn_means_c, nvi::ElementWiseOperation::kMIN), name + "/mean_sub");
-    input = name_and_get_output(network->addElementWise(*input, *bn_stddivs_c, nvi::ElementWiseOperation::kDIV), name + "/std_div");
+    if(!is_identity_elementwise(bn_stddivs, 1.0)) {
+        auto bn_stddivs_c = name_and_get_output(network->addConstant(dims_channel, vector_to_weights(bn_stddivs)), name + "/constant_stddiv");
+        input = name_and_get_output(network->addElementWise(*input, *bn_stddivs_c, nvi::ElementWiseOperation::kDIV), name + "/std_div");
+    }
 
-    if(bn_betas.size() > 0) {
+    if(!is_identity_elementwise(bn_betas, 0.0)) {
         auto bn_betas_c = network->addConstant(dims_channel, vector_to_weights(bn_betas))->getOutput(0);
         input = network->addElementWise(*input, *bn_betas_c, nvi::ElementWiseOperation::kSUM)->getOutput(0);
     }
 
-    if(bn_gammas.size() > 0) {
+    if(!is_identity_elementwise(bn_gammas, 1.0)) {
         auto bn_gammas_c = network->addConstant(dims_channel, vector_to_weights(bn_gammas))->getOutput(0);
         input = network->addElementWise(*input, *bn_gammas_c, nvi::ElementWiseOperation::kPROD)->getOutput(0);
     }
@@ -66,12 +76,56 @@ nvi::ITensor* process_bn(const FloatVector& bn_means, const FloatVector& bn_stdd
     return input;
 }
 
-nvi::ITensor* process_convblock(const lczero::LegacyWeights::ConvBlock& conv_desc,
+void simply_conv_block(LegacyWeights::ConvBlock& block, bool foldBNLayer = false) {
+    const float epsilon = 1e-5f;
+
+    // Compute reciprocal of std-dev from the variances (so that it can be
+    // just multiplied).
+    std::vector<float>& stddev = block.bn_stddivs;
+    for (auto&& w : stddev) {
+        w = 1.0f / std::sqrt(w + epsilon);
+    }
+
+    // Biases are not calculated and are typically zero but some networks
+    // might still have non-zero biases. Move biases to batchnorm means to
+    // make the output match without having to separately add the biases.
+    for (auto j = size_t{0}; j < block.bn_means.size(); j++) {
+        block.bn_means[j] -= block.biases[j];
+        block.biases[j] = 0.0f;
+    }
+
+    // Get rid of the BN layer by adjusting weights and biases of the
+    // convolution idea proposed by Henrik Forstn and first implemented in
+    // leela go zero.
+    if (foldBNLayer) {
+        const int outputs = block.biases.size();
+        const int channels = block.weights.size() / (outputs * 3 * 3);
+
+        for (auto o = 0; o < outputs; o++) {
+        for (auto c = 0; c < channels; c++) {
+            for (auto i = 0; i < 9; i++) {
+            block.weights[o * channels * 9 + c * 9 + i] *= block.bn_stddivs[o];
+            }
+        }
+
+        block.bn_means[o] *= block.bn_stddivs[o];
+        block.bn_stddivs[o] = 1.0f;
+
+        // Move means to convolution biases.
+        block.biases[o] = -block.bn_means[o];
+        block.bn_means[o] = 0.0f;
+        }
+    }
+}
+
+nvi::ITensor* process_convblock(lczero::LegacyWeights::ConvBlock& conv_desc,
                                 int numOutputMaps, nvi::ITensor* input, nvi::INetworkDefinition* network,
                                 int size = 3, std::string name = "") {
     if(numOutputMaps == -1) {
         numOutputMaps = conv_desc.bn_means.size();
     }
+
+    simply_conv_block(conv_desc, true);
 
     auto conv = network->addConvolution(*input, numOutputMaps, {size, size},
         vector_to_weights(conv_desc.weights),
@@ -85,7 +139,7 @@ nvi::ITensor* process_convblock(const lczero::LegacyWeights::ConvBlock& conv_des
                       conv->getOutput(0), network, name + "/bn");
 }
 
-nvi::ITensor* process_residual(const lczero::LegacyWeights::Residual& desc, nvi::ITensor* input, nvi::INetworkDefinition* network, std::string name = "") {
+nvi::ITensor* process_residual(lczero::LegacyWeights::Residual& desc, nvi::ITensor* input, nvi::INetworkDefinition* network, std::string name = "") {
     int num_filters = input->getDimensions().d[0];
     auto current = input;
 
@@ -98,7 +152,7 @@ nvi::ITensor* process_residual(const lczero::LegacyWeights::Residual& desc, nvi:
     return current;
 }
 
-nvi::ITensor* process_policy_head(const LegacyWeights::ConvBlock& conv,
+nvi::ITensor* process_policy_head(LegacyWeights::ConvBlock& conv,
                                   const FloatVector& ip_pol_w, const FloatVector& ip_pol_b,
                                   nvi::ITensor* input, nvi::INetworkDefinition* network) {
     auto current = input;
@@ -113,7 +167,7 @@ nvi::ITensor* process_policy_head(const LegacyWeights::ConvBlock& conv,
 
 
 nvi::ITensor* process_value_head(
-        const LegacyWeights::ConvBlock& conv,
+        LegacyWeights::ConvBlock& conv,
         const FloatVector& ip1_val_w,
         const FloatVector& ip1_val_b,
         const FloatVector& ip2_val_w,
@@ -131,13 +185,41 @@ nvi::ITensor* process_value_head(
     return current;
 }
 
-TensorRTNetwork::TensorRTNetwork(const WeightsFile& file, const OptionsDict options)
-    : builder(nullptr), engine(nullptr), max_batch_size(0) {
+void save_serialized_model(nvi::IHostMemory* model) {
+    auto file = fopen("serialized_model.dat", "wb");
+    size_t size = model->size();
 
-    LegacyWeights weights(file.weights());
-    max_batch_size = options.GetOrDefault<int>("max_batch", 1024);
+    fwrite(&size, sizeof(size), 1, file);
+    fwrite(model->data(), 1, size, file);
 
-    builder = nvi::createInferBuilder(gLogger);
+    fclose(file);
+}
+
+std::tuple<nvi::ICudaEngine*, nvi::IRuntime*> load_serialized_model(nvi::ILogger& logger) {
+    auto file = fopen("serialized_model.dat", "rb");
+
+    if(!file) {
+        return {nullptr, nullptr};
+    }
+
+    size_t size;
+    fread(&size, sizeof(size), 1, file);
+
+    char* buffer = new char[size];
+
+    fread(buffer, 1, size, file);
+    fclose(file);
+
+    nvi::IRuntime* runtime = nvi::createInferRuntime(logger);
+    nvi::ICudaEngine* engine = runtime->deserializeCudaEngine(buffer, size, nullptr);
+
+    delete[] buffer;
+
+    return std::make_tuple(engine, runtime);
+}
+
+std::tuple<nvi::ICudaEngine*, nvi::IBuilder*> create_model(nvi::ILogger& logger, LegacyWeights& weights, int max_batch_size) {
+    nvi::IBuilder* builder = nvi::createInferBuilder(logger);
     nvi::INetworkDefinition* network = builder->createNetwork();
 
     nvi::ITensor* current = network->addInput("input", nvi::DataType::kFLOAT, nvi::Dims3(112, 8, 8));
@@ -166,13 +248,36 @@ TensorRTNetwork::TensorRTNetwork(const WeightsFile& file, const OptionsDict opti
     builder->setMaxBatchSize(max_batch_size);
     builder->setMaxWorkspaceSize(1 << 20);
 
-    engine = builder->buildCudaEngine(*network);
+    nvi::ICudaEngine* engine = builder->buildCudaEngine(*network);
     network->destroy();
+
+    return std::make_tuple(engine, builder);
+}
+
+TensorRTNetwork::TensorRTNetwork(const WeightsFile& file, const OptionsDict options)
+    : runtime(nullptr), builder(nullptr), engine(nullptr), max_batch_size(0) {
+
+    max_batch_size = options.GetOrDefault<int>("max_batch", 1024);
+
+    std::tie(engine, runtime) = load_serialized_model(gLogger);
+
+    if(!engine) {
+        LegacyWeights weights(file.weights());
+        std::tie(engine, builder) = create_model(gLogger, weights, max_batch_size);
+
+        // serialize created model
+        nvi::IHostMemory* serializedModel = engine->serialize();
+        save_serialized_model(serializedModel);
+        serializedModel->destroy();
+    }
+
+    assert(engine);
 }
 
 TensorRTNetwork::~TensorRTNetwork() {
     if(engine) engine->destroy();
     if(builder) builder->destroy();
+    if(runtime) runtime->destroy();
 }
 
 class TensorRTNetworkComputation : public NetworkComputation {

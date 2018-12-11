@@ -357,7 +357,8 @@ if get_option('build_backends')
 
   # .cc files for TensorRT.
   cuda_tensorrt_files = [
-    'src/neural/cuda/network_tensorrt.cc'
+    'src/neural/cuda/network_tensorrt.cc',
+    'src/neural/cuda/network_tensorrt_definition.cc'
   ]
 
   if get_option('cudnn') and cu_blas.found() and cu_dnn.found() and cu_dart.found() and nvcc.found()

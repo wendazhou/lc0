@@ -83,6 +83,11 @@ option('cudnn',
        value: true,
        description: 'Enable cuDNN backend')
 
+option('tensorrt',
+       type: 'boolean',
+       value: true,
+       description: 'Enable TensorRT backend')
+
 option('opencl',
        type: 'boolean',
        value: true,

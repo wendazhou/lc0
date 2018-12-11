@@ -39,8 +39,8 @@ nvi::ITensor* name_and_get_output(nvi::ILayer* layer, std::string name) {
     return layer->getOutput(0);
 }
 
-nvi::ITensor* process_bn(FloatVector bn_means, FloatVector bn_stddivs,
-                         FloatVector bn_gammas, FloatVector bn_betas,
+nvi::ITensor* process_bn(const FloatVector& bn_means, const FloatVector& bn_stddivs,
+                         const FloatVector& bn_gammas,const FloatVector& bn_betas,
                          nvi::ITensor* input, nvi::INetworkDefinition* network,
                          std::string name = "") {
     auto num_channels = input->getDimensions().d[0];
@@ -99,7 +99,7 @@ nvi::ITensor* process_residual(const lczero::LegacyWeights::Residual& desc, nvi:
 }
 
 nvi::ITensor* process_policy_head(const LegacyWeights::ConvBlock& conv,
-                                  FloatVector ip_pol_w, FloatVector ip_pol_b,
+                                  const FloatVector& ip_pol_w, const FloatVector& ip_pol_b,
                                   nvi::ITensor* input, nvi::INetworkDefinition* network) {
     auto current = input;
     current = process_convblock(conv, 32, current, network, 1, "policy/conv");
@@ -111,12 +111,13 @@ nvi::ITensor* process_policy_head(const LegacyWeights::ConvBlock& conv,
     return current;
 }
 
+
 nvi::ITensor* process_value_head(
         const LegacyWeights::ConvBlock& conv,
-        FloatVector ip1_val_w,
-        FloatVector ip1_val_b,
-        FloatVector ip2_val_w,
-        FloatVector ip2_val_b,
+        const FloatVector& ip1_val_w,
+        const FloatVector& ip1_val_b,
+        const FloatVector& ip2_val_w,
+        const FloatVector& ip2_val_b,
         nvi::ITensor* input,
         nvi::INetworkDefinition* network) {
 
@@ -134,7 +135,7 @@ TensorRTNetwork::TensorRTNetwork(const WeightsFile& file, const OptionsDict opti
     : builder(nullptr), engine(nullptr), max_batch_size(0) {
 
     LegacyWeights weights(file.weights());
-    max_batch_size = options.GetOrDefault<int>("max_batch", 256);
+    max_batch_size = options.GetOrDefault<int>("max_batch", 1024);
 
     builder = nvi::createInferBuilder(gLogger);
     nvi::INetworkDefinition* network = builder->createNetwork();
@@ -190,6 +191,7 @@ private:
 
     int in_batch;
     int max_batch_size;
+    bool computation_done;
 
     const int single_input_size = 112 * 8 * 8;
     const int single_output_pol_size = 1858;
@@ -203,16 +205,16 @@ public:
     // Returns how many times AddInput() was called.
     int GetBatchSize() const override { return in_batch; }
     // Returns Q value of @sample.
-    float GetQVal(int sample) const override { return output_value_buffer[sample]; }
+    float GetQVal(int sample) const override { assert(computation_done); return output_value_buffer[sample]; }
     // Returns P value @move_id of @sample.
-    float GetPVal(int sample, int move_id) const override { return output_policy_buffer[sample * single_output_pol_size + move_id]; }
+    float GetPVal(int sample, int move_id) const override { assert(computation_done); return output_policy_buffer[sample * single_output_pol_size + move_id]; }
 };
 
 TensorRTNetworkComputation::TensorRTNetworkComputation(nvi::ICudaEngine* engine, int max_batch_size)
     : context(nullptr), stream(0), buffers{nullptr, nullptr, nullptr},
       input_buffer(nullptr), output_policy_buffer(nullptr), output_value_buffer(nullptr),
       input_index(-1), output_policy_index(-1), output_value_index(-1),
-      in_batch(0), max_batch_size(max_batch_size) {
+      in_batch(0), max_batch_size(max_batch_size), computation_done(false) {
 
     input_index = engine->getBindingIndex("input");
     output_policy_index = engine->getBindingIndex("output_policy");
@@ -236,19 +238,20 @@ TensorRTNetworkComputation::TensorRTNetworkComputation(nvi::ICudaEngine* engine,
 
 // CPU version of plane-encoding.
 // Eventually write custom plug-in for tensorrt and CUDA kernels.
-void ExpandPlane(const InputPlane& plane, float* buffer) {
+void EncodePlanes(const InputPlanes& sample, float* buffer) {
+  for (const InputPlane& plane : sample) {
     const float value = plane.value;
-    for (auto i = 0; i < 16; i++) {
-        *(buffer++) = (plane.mask & (((uint64_t)1) << i)) != 0 ? value : 0;
-    }
+    for (auto i = 0; i < 64; i++)
+      *(buffer++) = (plane.mask & (((uint64_t)1) << i)) != 0 ? value : 0;
+  }
 }
 
 void TensorRTNetworkComputation::AddInput(InputPlanes&& input) {
-    for(auto&& plane : input) {
-        assert(in_batch < max_batch_size);
-        ExpandPlane(plane, input_buffer.get() + in_batch * single_input_size);
-        in_batch += 1;
-    }
+    assert(in_batch < max_batch_size);
+    assert(input.size() == 112);
+
+    EncodePlanes(input, input_buffer.get() + in_batch * single_input_size);
+    in_batch += 1;
 }
 
 void TensorRTNetworkComputation::ComputeBlocking() {
@@ -267,6 +270,7 @@ void TensorRTNetworkComputation::ComputeBlocking() {
     ReportCUDAErrors(cudaStreamSynchronize(stream));
 
     in_batch = 0;
+    computation_done = true;
 }
 
 

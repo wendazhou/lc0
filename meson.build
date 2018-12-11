@@ -375,7 +375,7 @@ if get_option('build_backends')
       cuda_arguments += ['-Xcompiler']
 
       # Selectively link to debug or release MSVC runtime
-      if get_option('buildtype').startswith('debug')
+      if get_option('buildtype') == 'debug'
         cuda_arguments += ['-MDd']
       else
         cuda_arguments += ['-MD']

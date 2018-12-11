@@ -2,10 +2,16 @@
 #include <iostream>
 #include <string>
 #include <cstdio>
+#include <mutex>
+#include <queue>
 #include "cuda_common.h"
 #include "NvInfer.h"
 #include "neural/factory.h"
 #include "neural/network_legacy.h"
+
+#include "nvtx3/nvToolsExt.h"
+#include "nvtx3/nvToolsExtCuda.h"
+#include "nvtx3/nvToolsExtCudaRt.h"
 
 namespace nvi = nvinfer1;
 
@@ -19,12 +25,138 @@ class Logger : public nvi::ILogger {
 } gLogger;
 
 
+class TensorRTComputationResource {
+private:
+    void* buffers[3];
+    float* input_buffer_;
+    float* output_policy_buffer_;
+    float* output_value_buffer_;
+
+    cudaStream_t stream_;
+
+    int max_batch_size_;
+    int input_index;
+    int output_policy_index;
+    int output_value_index;
+    int resource_id_;
+
+    const int single_input_size = 112 * 8 * 8;
+    const int single_output_pol_size = 1858;
+public:
+    TensorRTComputationResource(int max_batch_size, int input_index, int output_policy_index, int output_value_index, int resource_id = -1)
+        : buffers{nullptr, nullptr, nullptr}, input_buffer_(nullptr), output_policy_buffer_(nullptr), output_value_buffer_(nullptr),
+            stream_(0), max_batch_size_(max_batch_size), input_index(input_index),
+            output_policy_index(output_policy_index), output_value_index(output_value_index), resource_id_(resource_id) {
+        
+        size_t input_size = max_batch_size * single_input_size;
+        size_t output_pol_size = max_batch_size * single_output_pol_size;
+        size_t output_val_size = max_batch_size;
+        
+        ReportCUDAErrors(cudaMalloc(&buffers[input_index], input_size * sizeof(float)));
+        ReportCUDAErrors(cudaMalloc(&buffers[output_policy_index], output_pol_size * sizeof(float)));
+        ReportCUDAErrors(cudaMalloc(&buffers[output_value_index], output_val_size * sizeof(float)));
+
+        ReportCUDAErrors(cudaMallocHost(&input_buffer_, input_size * sizeof(float)));
+        ReportCUDAErrors(cudaMallocHost(&output_policy_buffer_, output_pol_size * sizeof(float)));
+        ReportCUDAErrors(cudaMallocHost(&output_value_buffer_, output_val_size * sizeof(float)));
+
+        ReportCUDAErrors(cudaStreamCreate(&stream_));
+        std::string name = "Network Compute Stream " + std::to_string(resource_id_);
+        nvtxNameCudaStreamA(stream_, name.c_str());
+    }
+
+    ~TensorRTComputationResource() {
+        for(auto ptr : buffers) {
+            if(ptr) cudaFree(ptr);
+        }
+
+        if (input_buffer_) ReportCUDAErrors(cudaFreeHost(input_buffer_));
+        if (output_policy_buffer_) ReportCUDAErrors(cudaFreeHost(output_policy_buffer_));
+        if (output_value_buffer_) ReportCUDAErrors(cudaFreeHost(output_value_buffer_));
+
+        if(stream_) ReportCUDAErrors(cudaStreamDestroy(stream_));
+    }
+
+    cudaStream_t& stream() { return stream_; }
+    float* input_buffer() { return input_buffer_; }
+    float* output_policy_buffer() { return output_policy_buffer_; }
+    float* output_value_buffer() { return output_value_buffer_; }
+
+    int max_batch_size() const { return max_batch_size_; }
+    int resource_id() const { return resource_id_; }
+
+    void EnqueueLoadData(int batch_size) {
+        ReportCUDAErrors(cudaMemcpyAsync(buffers[input_index], input_buffer_,
+            batch_size * single_input_size * sizeof(float),
+            cudaMemcpyKind::cudaMemcpyHostToDevice, stream_));
+    }
+
+    void EnqueueUnloadResults(int batch_size) {
+        ReportCUDAErrors(cudaMemcpyAsync(output_policy_buffer_, buffers[output_policy_index],
+            batch_size * single_output_pol_size * sizeof(float), cudaMemcpyKind::cudaMemcpyDeviceToHost, stream_));
+        
+        ReportCUDAErrors(cudaMemcpyAsync(output_value_buffer_, buffers[output_value_index],
+            batch_size * sizeof(float), cudaMemcpyKind::cudaMemcpyDeviceToHost, stream_));
+    }
+
+    void EnqueueContextExecute(int batch_size, nvi::IExecutionContext* context) {
+        context->enqueue(batch_size, buffers, stream_, nullptr);
+    }
+
+    void SynchronizeStream() {
+        ReportCUDAErrors(cudaStreamSynchronize(stream_));
+    }
+};
+
+
+class ComputationResourceCache {
+    int max_batch_size_;
+    int input_index_;
+    int output_policy_index_;
+    int output_value_index_;
+
+    int total_resources;
+
+    std::mutex mutex;
+    std::queue<std::unique_ptr<TensorRTComputationResource>> resources;
+public:
+    ComputationResourceCache(int max_batch_size, int input_index, int output_policy_index, int output_value_index)
+        : max_batch_size_(max_batch_size), input_index_(input_index),
+          output_policy_index_(output_policy_index), output_value_index_(output_value_index),
+          total_resources(0), mutex(), resources()
+    {
+    }
+
+    std::unique_ptr<TensorRTComputationResource> GetNewResource() {
+        std::lock_guard<std::mutex> lock(mutex);
+
+        if(resources.empty()) {
+            total_resources += 1;
+            return std::make_unique<TensorRTComputationResource>(max_batch_size_, input_index_,
+                output_policy_index_, output_value_index_, total_resources);
+        }
+
+        std::unique_ptr<TensorRTComputationResource> result = std::move(resources.front());
+        resources.pop();
+
+        return result;
+    }
+
+    void ReleaseResource(std::unique_ptr<TensorRTComputationResource> resource) {
+        std::lock_guard<std::mutex> lock(mutex);
+        resources.emplace(std::move(resource));
+    }
+};
+
+
 class TensorRTNetwork : public Network {
 private:
     nvi::IRuntime* runtime;
     nvi::IBuilder* builder;
     nvi::ICudaEngine* engine;
+    nvi::IExecutionContext* context;
     int max_batch_size;
+    std::unique_ptr<ComputationResourceCache> resource_cache;
 public:
     TensorRTNetwork(const WeightsFile& weights, const OptionsDict options);
     virtual ~TensorRTNetwork();
@@ -76,7 +208,7 @@ nvi::ITensor* process_bn(const FloatVector& bn_means, const FloatVector& bn_stdd
     return input;
 }
 
-void simply_conv_block(LegacyWeights::ConvBlock& block, bool foldBNLayer = false) {
+void simplify_conv_block(LegacyWeights::ConvBlock& block, bool foldBNLayer = false) {
     const float epsilon = 1e-5f;
 
     // Compute reciprocal of std-dev from the variances (so that it can be
@@ -125,7 +257,7 @@ nvi::ITensor* process_convblock(lczero::LegacyWeights::ConvBlock& conv_desc,
         numOutputMaps = conv_desc.bn_means.size();
     }
 
-    simply_conv_block(conv_desc, true);
+    simplify_conv_block(conv_desc, true);
 
     auto conv = network->addConvolution(*input, numOutputMaps, {size, size},
         vector_to_weights(conv_desc.weights),
@@ -246,7 +378,7 @@ std::tuple<nvi::ICudaEngine*, nvi::IBuilder*> create_model(nvi::ILogger& logger,
     network->markOutput(*output_val);
 
     builder->setMaxBatchSize(max_batch_size);
-    builder->setMaxWorkspaceSize(1 << 20);
+    builder->setMaxWorkspaceSize(1 << 25);
 
     nvi::ICudaEngine* engine = builder->buildCudaEngine(*network);
     network->destroy();
@@ -257,7 +389,7 @@ std::tuple<nvi::ICudaEngine*, nvi::IBuilder*> create_model(nvi::ILogger& logger,
 TensorRTNetwork::TensorRTNetwork(const WeightsFile& file, const OptionsDict options)
     : runtime(nullptr), builder(nullptr), engine(nullptr), max_batch_size(0) {
 
-    max_batch_size = options.GetOrDefault<int>("max_batch", 1024);
+    max_batch_size = options.GetOrDefault<int>("max_batch", 256);
 
     std::tie(engine, runtime) = load_serialized_model(gLogger);
 
@@ -271,10 +403,17 @@ TensorRTNetwork::TensorRTNetwork(const WeightsFile& file, const OptionsDict opti
         serializedModel->destroy();
     }
 
-    assert(engine);
+    context = engine->createExecutionContext();
+
+    int input_index = engine->getBindingIndex("input");
+    int output_policy_index = engine->getBindingIndex("output_policy");
+    int output_value_index = engine->getBindingIndex("output_value");
+
+    resource_cache = std::make_unique<ComputationResourceCache>(max_batch_size, input_index, output_policy_index, output_value_index);
 }
 
 TensorRTNetwork::~TensorRTNetwork() {
+    if(context) context->destroy();
     if(engine) engine->destroy();
     if(builder) builder->destroy();
     if(runtime) runtime->destroy();
@@ -283,25 +422,16 @@ TensorRTNetwork::~TensorRTNetwork() {
 class TensorRTNetworkComputation : public NetworkComputation {
 private:
     nvi::IExecutionContext* context;
-    cudaStream_t stream;
-
-    void* buffers[3];
-    std::unique_ptr<float[]> input_buffer;
-    std::unique_ptr<float[]> output_policy_buffer;
-    std::unique_ptr<float[]> output_value_buffer;
-
-    int input_index;
-    int output_policy_index;
-    int output_value_index;
+    ComputationResourceCache* cache;
+    std::unique_ptr<TensorRTComputationResource> resource;
 
     int in_batch;
-    int max_batch_size;
     bool computation_done;
 
     const int single_input_size = 112 * 8 * 8;
     const int single_output_pol_size = 1858;
 public:
-    TensorRTNetworkComputation(nvi::ICudaEngine* engine, int max_batch_size);
+    TensorRTNetworkComputation(nvi::IExecutionContext* context, ComputationResourceCache* resource_cache);
     virtual ~TensorRTNetworkComputation();
 
     void AddInput(InputPlanes&& input) override;
@@ -310,36 +440,13 @@ public:
     // Returns how many times AddInput() was called.
     int GetBatchSize() const override { return in_batch; }
     // Returns Q value of @sample.
-    float GetQVal(int sample) const override { assert(computation_done); return output_value_buffer[sample]; }
+    float GetQVal(int sample) const override { assert(computation_done); return resource->output_value_buffer()[sample]; }
     // Returns P value @move_id of @sample.
-    float GetPVal(int sample, int move_id) const override { assert(computation_done); return output_policy_buffer[sample * single_output_pol_size + move_id]; }
+    float GetPVal(int sample, int move_id) const override { assert(computation_done); return resource->output_policy_buffer()[sample * single_output_pol_size + move_id]; }
 };
 
-TensorRTNetworkComputation::TensorRTNetworkComputation(nvi::ICudaEngine* engine, int max_batch_size)
-    : context(nullptr), stream(0), buffers{nullptr, nullptr, nullptr},
-      input_buffer(nullptr), output_policy_buffer(nullptr), output_value_buffer(nullptr),
-      input_index(-1), output_policy_index(-1), output_value_index(-1),
-      in_batch(0), max_batch_size(max_batch_size), computation_done(false) {
-
-    input_index = engine->getBindingIndex("input");
-    output_policy_index = engine->getBindingIndex("output_policy");
-    output_value_index = engine->getBindingIndex("output_value");
-    context = engine->createExecutionContext();
-
-    size_t input_size = max_batch_size * single_input_size;
-    size_t output_pol_size = max_batch_size * single_output_pol_size;
-    size_t output_val_size = max_batch_size;
-
-    ReportCUDAErrors(cudaMalloc(&buffers[input_index], input_size * sizeof(float)));
-    ReportCUDAErrors(cudaMalloc(&buffers[output_policy_index], output_pol_size * sizeof(float)));
-    ReportCUDAErrors(cudaMalloc(&buffers[output_value_index], output_val_size * sizeof(float)));
-
-    ReportCUDAErrors(cudaStreamCreate(&stream));
-
-    input_buffer.reset(new float[input_size]);
-    output_policy_buffer.reset(new float[output_pol_size]);
-    output_value_buffer.reset(new float[output_val_size]);
-}
+TensorRTNetworkComputation::TensorRTNetworkComputation(nvi::IExecutionContext* context, ComputationResourceCache* resource_cache)
+    : context(context), cache(resource_cache), in_batch(0), computation_done(false), resource(resource_cache->GetNewResource()) { }
 
 // CPU version of plane-encoding.
 // Eventually write custom plug-in for tensorrt and CUDA kernels.
@@ -352,27 +459,23 @@ void EncodePlanes(const InputPlanes& sample, float* buffer) {
 }
 
 void TensorRTNetworkComputation::AddInput(InputPlanes&& input) {
-    assert(in_batch < max_batch_size);
+    assert(in_batch < resource->max_batch_size());
     assert(input.size() == 112);
 
-    EncodePlanes(input, input_buffer.get() + in_batch * single_input_size);
+    EncodePlanes(input, resource->input_buffer() + in_batch * single_input_size);
     in_batch += 1;
 }
 
 void TensorRTNetworkComputation::ComputeBlocking() {
-    ReportCUDAErrors(cudaMemcpyAsync(buffers[input_index], input_buffer.get(),
-        in_batch * single_input_size * sizeof(float),
-        cudaMemcpyKind::cudaMemcpyHostToDevice, stream));
-    
-    context->enqueue(in_batch, buffers, stream, nullptr);
+    std::string range_name = "NetworkEvaluation" + std::to_string(resource->resource_id());
+    auto range_id = nvtxRangeStartA(range_name.c_str());
 
-    ReportCUDAErrors(cudaMemcpyAsync(output_policy_buffer.get(), buffers[output_policy_index],
-        in_batch * single_output_pol_size * sizeof(float), cudaMemcpyKind::cudaMemcpyDeviceToHost, stream));
-    
-    ReportCUDAErrors(cudaMemcpyAsync(output_value_buffer.get(), buffers[output_value_index],
-        in_batch * sizeof(float), cudaMemcpyKind::cudaMemcpyDeviceToHost, stream));
-    
-    ReportCUDAErrors(cudaStreamSynchronize(stream));
+    resource->EnqueueLoadData(in_batch);
+    resource->EnqueueContextExecute(in_batch, context);
+    resource->EnqueueUnloadResults(in_batch);
+    resource->SynchronizeStream();
+
+    nvtxRangeEnd(range_id);
 
     in_batch = 0;
     computation_done = true;
@@ -380,17 +483,12 @@ void TensorRTNetworkComputation::ComputeBlocking() {
 
 
 TensorRTNetworkComputation::~TensorRTNetworkComputation() {
-    for(auto ptr : buffers) {
-        if(ptr) cudaFree(ptr);
-    }
-
-    if(stream) ReportCUDAErrors(cudaStreamDestroy(stream));
-    if(context) context->destroy();
+    cache->ReleaseResource(std::move(resource));
 }
 
 
 std::unique_ptr<NetworkComputation> TensorRTNetwork::NewComputation() {
-    return std::make_unique<TensorRTNetworkComputation>(engine, max_batch_size);
+    return std::make_unique<TensorRTNetworkComputation>(context, resource_cache.get());
 }
 
 std::unique_ptr<Network> MakeTensorRTNetwork(const WeightsFile &weights, const OptionsDict &options) {

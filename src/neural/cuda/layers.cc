@@ -385,7 +385,6 @@ void SELayer<float>::Eval(int N, float* output, const float* input,
                           const float* /*input2*/, void* scratch,
                           size_t scratch_size, cudnnHandle_t /*cudnn*/,
                           cublasHandle_t cublas) {
-  assert(output == input2);
   // Ping-pong between 'op1' and 'op2' (parts of scratch memory).
   float* op1 = (float*)scratch;
   float* op2 = (float*)scratch + scratch_size / sizeof(float) / 2;

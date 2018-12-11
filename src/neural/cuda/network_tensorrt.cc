@@ -1,5 +1,6 @@
 #include <memory>
 #include <iostream>
+#include <string>
 #include "cuda_common.h"
 #include "NvInfer.h"
 #include "neural/factory.h"
@@ -16,22 +17,12 @@ class Logger : public nvi::ILogger {
     }
 } gLogger;
 
-class ExpandPlanesPlugin : public nvi::IPluginV2 {
-public:
-    virtual ~ExpandPlanesPlugin() {}
-
-    int getNbOutputs() const override { return 1; }
-
-    nvi::Dims getOutputDimensions(int index, const nvi::Dims* inputs, int nbInputDims) override;
-    bool supportsFormat(nvi::DataType datatype, nvi::PluginFormat format) override {
-        return (datatype == nvi::DataType::kFLOAT) && (format == nvi::PluginFormat::kNCHW);
-    }
-};
 
 class TensorRTNetwork : public Network {
 private:
     nvi::IBuilder* builder;
     nvi::ICudaEngine* engine;
+    int max_batch_size;
 public:
     TensorRTNetwork(const WeightsFile& weights, const OptionsDict options);
     virtual ~TensorRTNetwork();
@@ -40,50 +31,69 @@ public:
 };
 
 nvi::Weights vector_to_weights(FloatVector const& vector) {
-    return {nvi::DataType::kFLOAT, vector.data(), vector.size()};
+    return {nvi::DataType::kFLOAT, vector.data(), static_cast<int64_t>(vector.size())};
+}
+
+nvi::ITensor* name_and_get_output(nvi::ILayer* layer, std::string name) {
+    layer->setName(name.c_str());
+    return layer->getOutput(0);
 }
 
 nvi::ITensor* process_bn(FloatVector bn_means, FloatVector bn_stddivs,
                          FloatVector bn_gammas, FloatVector bn_betas,
-                         nvi::ITensor* input, nvi::INetworkDefinition* network) {
+                         nvi::ITensor* input, nvi::INetworkDefinition* network,
+                         std::string name = "") {
     auto num_channels = input->getDimensions().d[0];
     nvi::Dims3 dims_channel{num_channels, 1, 1};
     nvi::DataType dt = nvi::DataType::kFLOAT;
 
-    auto bn_means_c = network->addConstant(dims_channel, vector_to_weights(bn_means))->getOutput(0);
-    auto bn_stddivs_c = network->addConstant(dims_channel, vector_to_weights(bn_stddivs))->getOutput(0);
-    auto bn_gammas_c = network->addConstant(dims_channel, vector_to_weights(bn_gammas))->getOutput(0);
-    auto bn_betas_c = network->addConstant(dims_channel, vector_to_weights(bn_betas))->getOutput(0);
+    auto bn_means_c = name_and_get_output(network->addConstant(dims_channel, vector_to_weights(bn_means)), name + "/constant_mean");
+    auto bn_stddivs_c = name_and_get_output(network->addConstant(dims_channel, vector_to_weights(bn_stddivs)), name + "/constant_stddiv");
 
-    input = network->addElementWise(*input, *bn_means_c, nvi::ElementWiseOperation::kMIN)->getOutput(0);
-    input = network->addElementWise(*input, *bn_stddivs_c, nvi::ElementWiseOperation::kDIV)->getOutput(0);
-    input = network->addElementWise(*input, *bn_betas_c, nvi::ElementWiseOperation::kSUM)->getOutput(0);
-    input = network->addElementWise(*input, *bn_gammas_c, nvi::ElementWiseOperation::kPROD)->getOutput(0);
+    input = name_and_get_output(network->addElementWise(*input, *bn_means_c, nvi::ElementWiseOperation::kMIN), name + "/mean_sub");
+    input = name_and_get_output(network->addElementWise(*input, *bn_stddivs_c, nvi::ElementWiseOperation::kDIV), name + "/std_div");
+
+    if(bn_betas.size() > 0) {
+        auto bn_betas_c = network->addConstant(dims_channel, vector_to_weights(bn_betas))->getOutput(0);
+        input = network->addElementWise(*input, *bn_betas_c, nvi::ElementWiseOperation::kSUM)->getOutput(0);
+    }
+
+    if(bn_gammas.size() > 0) {
+        auto bn_gammas_c = network->addConstant(dims_channel, vector_to_weights(bn_gammas))->getOutput(0);
+        input = network->addElementWise(*input, *bn_gammas_c, nvi::ElementWiseOperation::kPROD)->getOutput(0);
+    }
 
     return input;
 }
 
 nvi::ITensor* process_convblock(const lczero::LegacyWeights::ConvBlock& conv_desc,
-                       int numOutputMaps, nvi::ITensor* input, nvi::INetworkDefinition* network) {
-    
-    auto conv = network->addConvolution(*input, numOutputMaps, {3, 3},
+                                int numOutputMaps, nvi::ITensor* input, nvi::INetworkDefinition* network,
+                                int size = 3, std::string name = "") {
+    if(numOutputMaps == -1) {
+        numOutputMaps = conv_desc.bn_means.size();
+    }
+
+    auto conv = network->addConvolution(*input, numOutputMaps, {size, size},
         vector_to_weights(conv_desc.weights),
         vector_to_weights(conv_desc.biases));
+    
+    conv->setPadding({(size - 1) / 2, (size - 1) / 2});
+    conv->setName(name.c_str());
 
     return process_bn(conv_desc.bn_means, conv_desc.bn_stddivs,
                       conv_desc.bn_gammas, conv_desc.bn_betas,
-                      conv->getOutput(0), network);
+                      conv->getOutput(0), network, name + "/bn");
 }
 
-nvi::ITensor* process_residual(const lczero::LegacyWeights::Residual& desc, nvi::ITensor* input, nvi::INetworkDefinition* network) {
+nvi::ITensor* process_residual(const lczero::LegacyWeights::Residual& desc, nvi::ITensor* input, nvi::INetworkDefinition* network, std::string name = "") {
     int num_filters = input->getDimensions().d[0];
     auto current = input;
 
-    current = process_convblock(desc.conv1, num_filters, current, network);
-    current = network->addActivation(*current, nvi::ActivationType::kRELU)->getOutput(0);
-    current = process_convblock(desc.conv2, num_filters, current, network);
-    current = network->addElementWise(*input, *current, nvi::ElementWiseOperation::kSUM)->getOutput(0);
-    current = network->addActivation(*current, nvi::ActivationType::kRELU)->getOutput(0);
+    current = process_convblock(desc.conv1, num_filters, current, network, 3, name + "/conv1");
+    current = name_and_get_output(network->addActivation(*current, nvi::ActivationType::kRELU), name + "/activation1");
+    current = process_convblock(desc.conv2, num_filters, current, network, 3, name + "/conv2");
+    current = name_and_get_output(network->addElementWise(*input, *current, nvi::ElementWiseOperation::kSUM), name + "/residual");
+    current = name_and_get_output(network->addActivation(*current, nvi::ActivationType::kRELU), name + "/activation2");
 
     return current;
 }
@@ -92,11 +102,11 @@ nvi::ITensor* process_policy_head(const LegacyWeights::ConvBlock& conv,
                                   FloatVector ip_pol_w, FloatVector ip_pol_b,
                                   nvi::ITensor* input, nvi::INetworkDefinition* network) {
     auto current = input;
-    current = process_convblock(conv, 32, current, network);
-    current = network->addFullyConnected(
-        *current, 1858, vector_to_weights(ip_pol_w), vector_to_weights(ip_pol_b))->getOutput(0);
+    current = process_convblock(conv, 32, current, network, 1, "policy/conv");
+    current = name_and_get_output(network->addFullyConnected(
+        *current, ip_pol_b.size(), vector_to_weights(ip_pol_w), vector_to_weights(ip_pol_b)), "policy/fc");
     
-    current = network->addSoftMax(*current)->getOutput(0);
+    current = name_and_get_output(network->addSoftMax(*current), "policy/softmax");
 
     return current;
 }
@@ -111,28 +121,32 @@ nvi::ITensor* process_value_head(
         nvi::INetworkDefinition* network) {
 
     auto current = input;
-    current = process_convblock(conv, 32, current, network);
-    current = network->addFullyConnected(*current, 128, vector_to_weights(ip1_val_w), vector_to_weights(ip1_val_b))->getOutput(0);
-    current = network->addActivation(*current, nvi::ActivationType::kRELU)->getOutput(0);
-    current = network->addFullyConnected(*current, 1, vector_to_weights(ip2_val_w), vector_to_weights(ip2_val_b))->getOutput(0);
-    current = network->addActivation(*current, nvi::ActivationType::kTANH)->getOutput(0);
+    current = process_convblock(conv, 32, current, network, 1, "value/conv");
+    current = name_and_get_output(network->addFullyConnected(*current, 128, vector_to_weights(ip1_val_w), vector_to_weights(ip1_val_b)), "value/fc1");
+    current = name_and_get_output(network->addActivation(*current, nvi::ActivationType::kRELU), "value/activation1");
+    current = name_and_get_output(network->addFullyConnected(*current, 1, vector_to_weights(ip2_val_w), vector_to_weights(ip2_val_b)), "value/fc2");
+    current = name_and_get_output(network->addActivation(*current, nvi::ActivationType::kTANH), "value/output");
 
     return current;
 }
 
 TensorRTNetwork::TensorRTNetwork(const WeightsFile& file, const OptionsDict options)
-    : builder(nullptr), engine(nullptr) {
+    : builder(nullptr), engine(nullptr), max_batch_size(0) {
+
     LegacyWeights weights(file.weights());
+    max_batch_size = options.GetOrDefault<int>("max_batch", 256);
 
     builder = nvi::createInferBuilder(gLogger);
     nvi::INetworkDefinition* network = builder->createNetwork();
 
     nvi::ITensor* current = network->addInput("input", nvi::DataType::kFLOAT, nvi::Dims3(112, 8, 8));
-    current = process_convblock(weights.input, 256, current, network);
+    current = process_convblock(weights.input, 256, current, network, 3, "initial_conv");
 
     // compute residual tower
+    int counter = 1;
     for(auto&& block : weights.residual) {
-        current = process_residual(block, current, network);
+        current = process_residual(block, current, network, "residual_block/" + std::to_string(counter));
+        counter += 1;
     }
 
     // policy head
@@ -148,8 +162,7 @@ TensorRTNetwork::TensorRTNetwork(const WeightsFile& file, const OptionsDict opti
     network->markOutput(*output_pol);
     network->markOutput(*output_val);
 
-    auto max_batch_size_ = options.GetOrDefault<int>("max_batch", 1024);
-    builder->setMaxBatchSize(max_batch_size_);
+    builder->setMaxBatchSize(max_batch_size);
     builder->setMaxWorkspaceSize(1 << 20);
 
     engine = builder->buildCudaEngine(*network);
@@ -188,11 +201,11 @@ public:
     // Do the computation.
     void ComputeBlocking() override;
     // Returns how many times AddInput() was called.
-    int GetBatchSize() const override;
+    int GetBatchSize() const override { return in_batch; }
     // Returns Q value of @sample.
-    float GetQVal(int sample) const override;
+    float GetQVal(int sample) const override { return output_value_buffer[sample]; }
     // Returns P value @move_id of @sample.
-    float GetPVal(int sample, int move_id) const override;
+    float GetPVal(int sample, int move_id) const override { return output_policy_buffer[sample * single_output_pol_size + move_id]; }
 };
 
 TensorRTNetworkComputation::TensorRTNetworkComputation(nvi::ICudaEngine* engine, int max_batch_size)
@@ -219,6 +232,23 @@ TensorRTNetworkComputation::TensorRTNetworkComputation(nvi::ICudaEngine* engine,
     input_buffer.reset(new float[input_size]);
     output_policy_buffer.reset(new float[output_pol_size]);
     output_value_buffer.reset(new float[output_val_size]);
+}
+
+// CPU version of plane-encoding.
+// Eventually write custom plug-in for tensorrt and CUDA kernels.
+void ExpandPlane(const InputPlane& plane, float* buffer) {
+    const float value = plane.value;
+    for (auto i = 0; i < 16; i++) {
+        *(buffer++) = (plane.mask & (((uint64_t)1) << i)) != 0 ? value : 0;
+    }
+}
+
+void TensorRTNetworkComputation::AddInput(InputPlanes&& input) {
+    for(auto&& plane : input) {
+        assert(in_batch < max_batch_size);
+        ExpandPlane(plane, input_buffer.get() + in_batch * single_input_size);
+        in_batch += 1;
+    }
 }
 
 void TensorRTNetworkComputation::ComputeBlocking() {
@@ -248,5 +278,16 @@ TensorRTNetworkComputation::~TensorRTNetworkComputation() {
     if(stream) ReportCUDAErrors(cudaStreamDestroy(stream));
     if(context) context->destroy();
 }
+
+
+std::unique_ptr<NetworkComputation> TensorRTNetwork::NewComputation() {
+    return std::make_unique<TensorRTNetworkComputation>(engine, max_batch_size);
+}
+
+std::unique_ptr<Network> MakeTensorRTNetwork(const WeightsFile &weights, const OptionsDict &options) {
+    return std::make_unique<TensorRTNetwork>(weights, options);
+}
+
+REGISTER_NETWORK("tensorrt", MakeTensorRTNetwork, 100);
 
 }}

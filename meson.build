@@ -335,13 +335,14 @@ if get_option('build_backends')
   cu_blas = cc.find_library('cublas', dirs: cudnn_libdirs, required: false)
   cu_dnn = cc.find_library('cudnn', dirs: cudnn_libdirs, required: false)
   cu_dart = cc.find_library('cudart', dirs: cudnn_libdirs, required: false)
+  cu_nvinfer = cc.find_library('nvinfer', dirs: cudnn_libdirs, required: false)
   nvcc = find_program('/usr/local/cuda/bin/nvcc', '/opt/cuda/bin/nvcc',
                       'nvcc', required: false)
 
   #.cc files
   cuda_files = [
     'src/neural/cuda/network_cudnn.cc',
-	'src/neural/cuda/layers.cc',
+	  'src/neural/cuda/layers.cc',
   ]
 
   # .cu files compiled without any specific sm version
@@ -352,6 +353,11 @@ if get_option('build_backends')
   # .cu files compiled with sm_70 (volta+). Only used by cudnn-fp16
   cuda_files_nvcc_fp16 = [
     'src/neural/cuda/fp16_kernels.cu',
+  ]
+
+  # .cc files for TensorRT.
+  cuda_tensorrt_files = [
+    'src/neural/cuda/network_tensorrt.cc'
   ]
 
   if get_option('cudnn') and cu_blas.found() and cu_dnn.found() and cu_dart.found() and nvcc.found()
@@ -366,7 +372,14 @@ if get_option('build_backends')
     cuda_arguments = ['@EXTRA_ARGS@', '-c', '@INPUT@', '-o', '@OUTPUT@',
                       '-I', meson.current_source_dir() + '/src']
     if host_machine.system() == 'windows'
-      cuda_arguments += ['-Xcompiler', '-MD']
+      cuda_arguments += ['-Xcompiler']
+
+      # Selectively link to debug or release MSVC runtime
+      if get_option('buildtype').startswith('debug')
+        cuda_arguments += ['-MDd']
+      else
+        cuda_arguments += ['-MD']
+      endif
     else
       cuda_arguments += ['--std=c++14', '-Xcompiler', '-fPIC']
     endif
@@ -382,10 +395,15 @@ if get_option('build_backends')
         output: outputname,
         arguments: cuda_arguments,
       )
-	 files += cuda_files
+	  files += cuda_files
     files += cuda_gen.process(cuda_files_nvcc_common)
     files += cuda_gen.process(cuda_files_nvcc_fp16, extra_args: ['-arch=compute_70', '-code=sm_70'])
     has_backends = true
+
+    if get_option('tensorrt') and cu_nvinfer.found()
+      files += cuda_tensorrt_files
+      deps += cu_nvinfer
+    endif
   endif
 
 endif # if get_option('build_backends')
